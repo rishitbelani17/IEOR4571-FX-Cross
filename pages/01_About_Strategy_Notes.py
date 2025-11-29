@@ -30,4 +30,4 @@ This dashboard includes:
 
 st.markdown("---")
 st.subheader("📞 Contact")
-st.write("Email: example@domain.com")
+st.write("Email: tp2899@columbia.edu")

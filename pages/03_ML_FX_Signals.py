@@ -102,10 +102,14 @@ st.markdown(
 @st.cache_data
 def load_fx(symbol, timeframe, start_date, end_date):
     interval = {
+        "1m": "1m",        # NEW
+        "15m": "15m",      # OPTIONAL – if you want
         "Daily": "1d",
         "4H": "4h",
         "1H": "1h",
         "Weekly": "1wk",
+        "Monthly": "1mo",
+        "Quarterly": "3mo"
     }[timeframe]
 
     df = yf.download(
@@ -264,6 +268,9 @@ def build_feature_matrix(prices, alpha, beta):
 with st.sidebar:
     st.markdown("### 🤖 ML FX Signal Engine")
 
+    st.markdown("#### Live Refresh")
+    refresh_now = st.button("🔄 Refresh Now (update latest data)")
+
     selected_pair = st.selectbox(
         "Choose FX Cross (major pairs)",
         MAJOR_FX_PAIRS,
@@ -277,7 +284,10 @@ with st.sidebar:
 
     symbol = custom_pair.strip() if custom_pair.strip() != "" else selected_pair
 
-    timeframe = st.selectbox("Timeframe", ["Daily", "4H", "1H", "Weekly"])
+    timeframe = st.selectbox(
+        "Timeframe",
+        ["1m", "15m", "1H", "4H", "Daily", "Weekly"]  # order: intraday → higher TF
+    )
 
     start_date = st.date_input("Start Date", value=datetime(2023, 1, 1))
     end_date = st.date_input("End Date", value=datetime.now())
@@ -285,6 +295,12 @@ with st.sidebar:
     if start_date >= end_date:
         st.error("End Date must be after Start Date.")
         st.stop()
+    
+    if timeframe == "1m":
+        # Yahoo only supports ~30 days of 1m data
+        if (end_date - start_date).days > 30:
+            st.warning("1m data limited to ~30 days on Yahoo. Clamping start date.")
+            start_date = end_date - pd.Timedelta(days=30)
 
     st.markdown("#### ES Parameters (for Features & Hybrid)")
     alpha = st.slider("α (slow smoothing)", 0.01, 0.5, 0.10, 0.01)
@@ -356,8 +372,8 @@ st.markdown(
 # ========================================================
 # 5. MAIN LOGIC
 # ========================================================
-if not run_button:
-    st.info("Configure parameters in the sidebar and click **Run ML Training + Hybrid Backtest**.")
+if not run_button and not refresh_now:
+    st.info("Configure parameters and click **Run ML Training + Hybrid Backtest**, or use **Refresh Now**.")
     st.stop()
 
 # ---- Load data ----
@@ -557,6 +573,73 @@ kpi_box(
     fmt=lambda v: f"{int(v)}",
 )
 
+# ========================================================
+# 7.5 LIVE SIGNAL SNAPSHOT (LATEST BAR)
+# ========================================================
+st.markdown(
+    """
+    <div class="section-header">
+      <h3>Live Signal Snapshot (Latest Bar)</h3>
+      <p>Current recommended action based on the most recent candle.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+def sig2text(sig):
+    if sig == 1:
+        return "📈 LONG"
+    elif sig == -1:
+        return "📉 SHORT"
+    return "⏸️ FLAT / NO TRADE"
+
+# Extract latest bar info
+last_ts = prices.index[-1]
+last_price = float(prices.iloc[-1])
+
+last_es = float(raw_es.iloc[-1])
+last_hybrid = float(raw_hybrid.iloc[-1])
+
+prev_es = float(raw_es.iloc[-2]) if len(raw_es) > 1 else 0
+prev_hybrid = float(raw_hybrid.iloc[-2]) if len(raw_hybrid) > 1 else 0
+
+flip_es = (last_es != prev_es)
+flip_hybrid = (last_hybrid != prev_hybrid)
+
+p_last_up = float(p_up_aligned.iloc[-1])
+p_last_down = 1.0 - p_last_up
+
+col_es, col_h = st.columns(2)
+
+# ----- PURE ES CARD -----
+with col_es:
+    st.markdown("<div class='kpi-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='kpi-label'>Pure ES α–β Strategy</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='kpi-value'>{sig2text(last_es)}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='kpi-sub'>Price: {last_price:.5f}<br>Bar time: {last_ts}</div>",
+        unsafe_allow_html=True,
+    )
+    if flip_es:
+        st.markdown("<div class='kpi-sub' style='color:#10B981;'>🔄 New trade signal triggered!</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='kpi-sub'>No change in signal</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ----- HYBRID CARD -----
+with col_h:
+    st.markdown("<div class='kpi-card'>", unsafe_allow_html=True)
+    st.markdown("<div class='kpi-label'>Hybrid ES + ML Strategy</div>", unsafe_allow_html=True)
+    st.markdown(f"<div class='kpi-value'>{sig2text(last_hybrid)}</div>", unsafe_allow_html=True)
+    st.markdown(
+        f"<div class='kpi-sub'>P(up): {p_last_up:.3f} | P(down): {p_last_down:.3f}<br>Price: {last_price:.5f}<br>Bar: {last_ts}</div>",
+        unsafe_allow_html=True,
+    )
+    if flip_hybrid:
+        st.markdown("<div class='kpi-sub' style='color:#10B981;'>🔄 ML-filtered trade triggered!</div>", unsafe_allow_html=True)
+    else:
+        st.markdown("<div class='kpi-sub'>No change in ML signal</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
 # ========================================================
 # 8. CHARTS – PRICE, EQUITY, P(UP)
