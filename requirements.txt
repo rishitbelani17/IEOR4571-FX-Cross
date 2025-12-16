@@ -11,3 +11,9 @@ beautifulsoup4
 lxml
 plotly
 shap
+tensorflow
+statsmodels
+scipy
+xgboost
+lightgbm
+catboost

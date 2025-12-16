@@ -12,7 +12,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import matplotlib.pyplot as plt
 
-from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -21,18 +21,20 @@ from sklearn.metrics import (
 )
 
 # Optional XAI (SHAP) – guarded import
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except ImportError:
-    SHAP_AVAILABLE = False
+# try:
+#     import shap
+#     SHAP_AVAILABLE = True
+# except ImportError:
+#     SHAP_AVAILABLE = False
+
+SHAP_AVAILABLE = False
 
 
 # ========================================================
 # STREAMLIT CONFIG + GLOBAL STYLES
 # ========================================================
 st.set_page_config(
-    page_title="ML FX Signals & Hybrid ES Strategy",
+    page_title="XGBoost ES + ML Strategy",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -103,8 +105,8 @@ st.markdown(
 def load_fx(symbol, timeframe, start_date, end_date):
     interval = {
         "Daily": "1d",
-        "4H": "4h",
-        "1H": "1h",
+        # "4H": "4h",
+        # "1H": "1h",
         "Weekly": "1wk",
         "Monthly": "1mo",
         "Quarterly": "3mo"
@@ -123,9 +125,8 @@ def load_fx(symbol, timeframe, start_date, end_date):
     if isinstance(df.columns, pd.MultiIndex):
         df = df[symbol]
 
-    df = df[["Close"]].dropna()
-    df.columns = ["price"]
-    df["price"] = df["price"].astype(float)
+    df = df[["Open", "High", "Low", "Close"]].dropna()
+    df = df.astype(float)    
     return df
 
 
@@ -211,29 +212,35 @@ def compute_rsi(series, window=14):
     return rsi
 
 
-def build_feature_matrix(prices, alpha, beta):
+def build_feature_matrix(df_ohlc, alpha, beta):
     """
     Build ML features + target:
     - Features: returns, volatility, MA diff, ES diff, RSI, etc.
     - Target: next-period direction (1 = up, 0 = down/flat)
     """
-    df = pd.DataFrame(index=prices.index)
-    df["price"] = prices
-    df["ret_1"] = prices.pct_change()
-    df["ret_2"] = prices.pct_change(2)
-    df["ret_5"] = prices.pct_change(5)
+    df = pd.DataFrame(index=df_ohlc.index)
+
+    close = df_ohlc["Close"]
+    high  = df_ohlc["High"]
+    low   = df_ohlc["Low"]
+
+    df["price"] = close
+    df["ret_1"] = close.pct_change()
+    df["ret_2"] = close.pct_change(2)
+    df["ret_5"] = close.pct_change(5)
+
 
     df["vol_10"] = df["ret_1"].rolling(10).std()
     df["vol_20"] = df["ret_1"].rolling(20).std()
 
-    df["ma_fast"] = prices.rolling(10).mean()
-    df["ma_slow"] = prices.rolling(30).mean()
+    df["ma_fast"] = close.rolling(10).mean()
+    df["ma_slow"] = close.rolling(30).mean()
     df["ma_diff"] = df["ma_fast"] - df["ma_slow"]
 
-    df["rsi_14"] = compute_rsi(prices, window=14)
+    df["rsi_14"] = compute_rsi(close, window=14)
 
-    es_alpha = exp_smooth(prices, alpha)
-    es_beta = exp_smooth(prices, beta)
+    es_alpha = exp_smooth(close, alpha)
+    es_beta = exp_smooth(close, beta)
     df["es_alpha"] = es_alpha
     df["es_beta"] = es_beta
     df["es_diff"] = df["es_beta"] - df["es_alpha"]
@@ -246,14 +253,121 @@ def build_feature_matrix(prices, alpha, beta):
     df["future_ret"] = df["ret_1"].shift(-1)
     df["y"] = (df["future_ret"] > 0).astype(int)
 
-    df = df.dropna()
-    feature_cols = [
-        "ret_1", "ret_2", "ret_5",
-        "vol_10", "vol_20",
-        "ma_diff",
-        "rsi_14",
-        "es_diff", "es_diff_lag1", "es_diff_lag2",
-    ]
+    df["log_ret_1"] = np.log(df["price"]).diff()
+    df["mom_10"] = df["price"] / df["price"].shift(10) - 1
+    df["mom_20"] = df["price"] / df["price"].shift(20) - 1
+    df["mom_60"] = df["price"] / df["price"].shift(60) - 1
+
+    def rolling_slope(series, window):
+        return series.rolling(window).apply(
+            lambda x: np.polyfit(np.arange(len(x)), x, 1)[0],
+            raw=False
+        )
+    
+    df["trend_slope_20"] = rolling_slope(np.log(df["price"]), 20)
+    df["trend_slope_60"] = rolling_slope(np.log(df["price"]), 60)
+
+    df["dist_high_20"] = df["price"] / df["price"].rolling(20).max() - 1
+    df["dist_low_20"]  = df["price"] / df["price"].rolling(20).min() - 1
+
+    df["true_range"] = np.maximum(
+        high - low,
+        np.maximum(
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        )
+    )
+
+    df["atr_14"] = df["true_range"].rolling(14).mean()
+
+    df["parkinson_vol_20"] = (
+        (1 / (4 * np.log(2))) * (np.log(high / low) ** 2)
+    ).rolling(20).mean()
+
+    vol10 = df["ret_1"].rolling(10).std()
+    vol50 = df["ret_1"].rolling(50).std()
+
+    df["vol_ratio_10_50"] = vol10 / (vol50.replace(0, np.nan))
+    df["vol_ratio_10_50"] = df["vol_ratio_10_50"].fillna(1.0)
+
+    ma20 = df["price"].rolling(20).mean()
+    std20 = df["price"].rolling(20).std()
+
+    df["z_price_20"] = (df["price"] - ma20) / (std20 + 1e-9)
+    df["bb_pos_20"] = (df["price"] - ma20) / (2 * std20 + 1e-9)
+    
+    ema12 = df["price"].ewm(span=12).mean()
+    ema26 = df["price"].ewm(span=26).mean()
+    df["macd"] = ema12 - ema26
+    df["macd_signal"] = df["macd"].ewm(span=9).mean()
+    df["macd_hist"] = df["macd"] - df["macd_signal"]
+
+    df["roc_10"] = df["price"].pct_change(10)
+
+    df["skew_20"] = df["ret_1"].rolling(20).skew()
+    df["kurt_20"] = df["ret_1"].rolling(20).kurt()
+
+    df["var_5_20"] = df["ret_1"].rolling(20).quantile(0.05)
+    df["cvar_5_20"] = df["ret_1"].rolling(20).apply(
+        lambda x: x[x <= np.quantile(x, 0.05)].mean()
+    )
+
+    def safe_conditional_std(x, cond):
+        vals = x[cond(x)]
+        return vals.std() if len(vals) >= 2 else 0.0
+
+    df["downside_vol_20"] = df["ret_1"].rolling(20).apply(
+        lambda x: safe_conditional_std(x, lambda v: v < 0)
+    )
+
+    df["upside_vol_20"] = df["ret_1"].rolling(20).apply(
+        lambda x: safe_conditional_std(x, lambda v: v > 0)
+    )
+
+    df["vol_asymmetry"] = df["downside_vol_20"] / (df["upside_vol_20"] + 1e-6)
+
+    df["ret_autocorr_1"] = df["ret_1"].rolling(20).corr(df["ret_1"].shift(1))
+    df["absret_autocorr"] = abs(df["ret_1"]).rolling(20).corr(abs(df["ret_1"]).shift(1))
+
+    def rolling_entropy(x, bins=10):
+        hist = np.histogram(x, bins=bins, density=True)[0]
+        hist = hist[hist > 0]
+        return -np.sum(hist * np.log(hist))
+    
+    df["entropy_ret_20"] = df["ret_1"].rolling(20).apply(rolling_entropy)
+    df["entropy_sign_20"] = np.sign(df["ret_1"]).rolling(20).apply(lambda x: rolling_entropy(x, bins=3))
+
+    cum = (1 + df["ret_1"]).cumprod()
+    roll_max = cum.rolling(50).max()
+    drawdown = cum / roll_max - 1
+
+    df["max_dd_50"] = drawdown.rolling(50).min()
+    df["max_dd_50"] = df["max_dd_50"].fillna(0)
+    df["time_under_water"] = (drawdown < 0).rolling(50).sum()
+    df["time_under_water"] = df["time_under_water"].fillna(0)
+
+    df["es_slope"] = df["es_diff"].diff()
+    df["es_accel"] = df["es_diff"].diff().diff()
+    df["es_norm"] = df["es_diff"] / (df["price"].rolling(20).std() + 1e-9)
+    df["es_strength"] = abs(df["es_diff"])
+
+    cross = (df["es_diff"].shift(1) * df["es_diff"] < 0)
+    df["bars_since_cross"] = cross.cumsum()
+    df["bars_since_cross"] = df.groupby("bars_since_cross").cumcount()
+
+    df["hour_sin"] = np.sin(2 * np.pi * df.index.hour / 24)
+    df["hour_cos"] = np.cos(2 * np.pi * df.index.hour / 24)
+    df["dow_sin"] = np.sin(2 * np.pi * df.index.dayofweek / 7)
+    df["dow_cos"] = np.cos(2 * np.pi * df.index.dayofweek / 7)
+
+    na_counts = df.isna().sum().sort_values(ascending=False)
+    print("Top NA features:")
+    print(na_counts.head(10))
+
+    # ---- controlled trimming based on max lookback ----
+    MAX_LOOKBACK = 65  # must cover largest rolling window (60) + buffer
+    df = df.iloc[MAX_LOOKBACK:-1]
+    feature_cols = [col for col in df.columns if col not in ["price", "future_ret", "y"]]
     X = df[feature_cols].copy()
     y = df["y"].copy()
 
@@ -349,12 +463,12 @@ st.markdown(
                 border: 1px solid #1F2937; margin-bottom: 1rem;">
       <div style="display:flex; justify-content:space-between; align-items:center;">
         <div>
-          <h2 style="color:#F9FAFB; margin-bottom:0.1rem;">
-            ML FX Signals & Hybrid Exponential Smoothing
-          </h2>
-          <p style="color:#9CA3AF; font-size:0.85rem; margin-top:0.15rem;">
-            Train a Random Forest to predict next-period direction, then overlay it on the α–β strategy as an ML filter.
-          </p>
+            <h2 style="color:#F9FAFB; margin-bottom:0.1rem;">
+            XGBoost ES + ML Hybrid Strategy
+            </h2>
+            <p style="color:#9CA3AF; font-size:0.85rem; margin-top:0.15rem;">
+            Train an XGBoost classifier to predict next-period direction, then overlay it on the α–β strategy as an ML filter.
+            </p>
         </div>
         <div style="text-align:right; color:#9CA3AF; font-size:0.80rem;">
           <div>Asset: <span style="color:#E5E7EB;">{symbol}</span></div>
@@ -376,44 +490,52 @@ if not run_button and not refresh_now:
 
 # ---- Load data ----
 df_px = load_fx(symbol, timeframe, start_date, end_date)
-prices = df_px["price"]
+prices = df_px["Close"]
 
 if len(prices) < 200:
     st.error("Not enough data for meaningful ML training (need at least ~200 points).")
     st.stop()
 
 # ---- Build features & target ----
-feat_df, X, y, feature_cols = build_feature_matrix(prices, alpha, beta)
+feat_df, X, y, feature_cols = build_feature_matrix(df_px, alpha, beta)
 
 n_samples = len(X)
 train_size = int(n_samples * train_frac)
 X_train, X_test = X.iloc[:train_size], X.iloc[train_size:]
 y_train, y_test = y.iloc[:train_size], y.iloc[train_size:]
 
-# ---- Train RF model ----
-rf = RandomForestClassifier(
-    n_estimators=300,
-    max_depth=6,
-    min_samples_leaf=10,
+# ---- Train XGBoost model ----
+xgb = XGBClassifier(
+    n_estimators=250,
+    max_depth=3,
+    learning_rate=0.03,
+    min_child_weight=20,
+    gamma=0.5,
+    subsample=0.6,
+    colsample_bytree=0.6,
+    reg_lambda=5.0,
+    reg_alpha=1.0,
+    objective="binary:logistic",
+    eval_metric="logloss",
     random_state=42,
-    class_weight="balanced",
     n_jobs=-1,
 )
-rf.fit(X_train, y_train)
+
+xgb.fit(X_train, y_train)
 
 # ---- Predictions ----
-proba_train = rf.predict_proba(X_train)[:, 1]
-proba_test = rf.predict_proba(X_test)[:, 1]
+proba_train = xgb.predict_proba(X_train)[:, 1]
+proba_test = xgb.predict_proba(X_test)[:, 1]
 y_pred_train = (proba_train > 0.5).astype(int)
 y_pred_test = (proba_test > 0.5).astype(int)
 
 # Attach probability to full index
-proba_full = rf.predict_proba(X)[:, 1]
+proba_full = xgb.predict_proba(X)[:, 1]
 p_up = pd.Series(proba_full, index=X.index, name="P(up)")
 
 
 # ========================================================
-# 6. ML PERFORMANCE KPIs
+# 6. ML PExgbORMANCE KPIs
 # ========================================================
 def kpi_box(col, label, value, sub=None, fmt=None):
     with col:
@@ -429,8 +551,8 @@ def kpi_box(col, label, value, sub=None, fmt=None):
 st.markdown(
     """
     <div class="section-header">
-      <h3>ML Model Performance</h3>
-      <p>RandomForest classifier predicting next-bar direction.</p>
+      <h3>ML Model Pexgbormance</h3>
+      <p>XGBoost classifier predicting next-bar direction.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -767,15 +889,16 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-fa = rf.feature_importances_
+fa = xgb.feature_importances_
 fi_df = pd.DataFrame({"Feature": feature_cols, "Importance": fa})
 fi_df = fi_df.sort_values("Importance", ascending=False)
+fi_df_top = fi_df.head(10)
 
 c1, c2 = st.columns([1.2, 1])
 
 with c1:
     fi_fig = px.bar(
-        fi_df,
+        fi_df_top,
         x="Importance",
         y="Feature",
         orientation="h",
@@ -794,142 +917,87 @@ with c2:
 
 st.markdown("---")
 
-# if SHAP_AVAILABLE:
-#     with st.expander("🔬 SHAP Explainability", expanded=False):
-#         import matplotlib.pyplot as plt
-
-#         st.caption("Sampling 300 points for SHAP computation.")
-#         X_sample = X.sample(min(300, len(X)), random_state=42)
-
-#         # Stable API
-#         explainer = shap.Explainer(rf, X_sample)
-#         shap_values = explainer(X_sample)
-
-#         # For classification: shap_values.values is (n, features, classes)
-#         if shap_values.values.ndim == 3:
-#             shap_vals = shap_values.values[:, :, 1]  # class = 1 ("UP")
-#         else:
-#             shap_vals = shap_values.values
-
-#         # --------------------------
-#         # GLOBAL SUMMARY PLOT
-#         # --------------------------
-#         st.write("### 🌍 Global SHAP Summary Plot")
-#         fig1, ax1 = plt.subplots(figsize=(8, 5))
-#         shap.summary_plot(shap_vals, X_sample, show=False)
-#         st.pyplot(fig1, clear_figure=True)
-
-#         # --------------------------
-#         # FEATURE IMPORTANCE BAR PLOT
-#         # --------------------------
-#         st.write("### 📊 SHAP Bar Plot (Feature Importance)")
-#         fig2, ax2 = plt.subplots(figsize=(8, 5))
-#         # shap_vals = (n_samples, n_features) — the class 1 SHAP matrix
-#         shap_vals = shap_values.values[:, :, 1]
-
-#         # compute mean absolute shap impact
-#         mean_abs = np.abs(shap_vals).mean(axis=0)
-
-#         # build pandas series for bar chart
-#         importance = pd.Series(mean_abs, index=X_sample.columns).sort_values(ascending=False)
-
-#         # plot manually using matplotlib
-#         fig2, ax2 = plt.subplots(figsize=(8, 5))
-#         importance.head(15).plot(kind="barh", ax=ax2)
-#         ax2.invert_yaxis()
-#         ax2.set_title("Feature Importance (Mean |SHAP|)")
-#         ax2.set_xlabel("Mean Absolute SHAP Value")
-#         st.pyplot(fig2, clear_figure=True)
-
-#         # --------------------------
-#         # NO LOCAL FORCE PLOT
-#         # --------------------------
-#         st.info(
-#             "Local force plots, decision plots, and waterfall plots are not supported in Streamlit "
-#             "because they require JavaScript rendering. Use global and bar plots instead."
-#         )
-
 with st.expander("🔬 SHAP Explainability (Plotly Version)", expanded=False):
+    if SHAP_AVAILABLE:
+        top_features = fi_df_top["Feature"].tolist()
+        X_sample = X[top_features].sample(min(300, len(X)), random_state=42)
 
-    X_sample = X.sample(min(300, len(X)), random_state=42)
+        explainer = shap.Explainer(xgb, X_sample)
+        shap_values = explainer(X_sample)
 
-    explainer = shap.Explainer(rf, X_sample)
-    shap_values = explainer(X_sample)
+        # Handle classification: take class 1
+        if shap_values.values.ndim == 3:
+            shap_vals = shap_values.values[:, :, 1]  # (n_samples, n_features)
+        else:
+            shap_vals = shap_values.values
+        st.write("### 📊 Global Feature Importance (Plotly)")
 
-    # Handle classification: take class 1
-    if shap_values.values.ndim == 3:
-        shap_vals = shap_values.values[:, :, 1]  # (n_samples, n_features)
+        mean_abs = np.abs(shap_vals).mean(axis=0)
+        importance = pd.DataFrame({
+            "feature": X_sample.columns,
+            "importance": mean_abs
+        }).sort_values("importance", ascending=False)
+
+        fig_imp = px.bar(
+            importance.head(10),
+            x="importance",
+            y="feature",
+            orientation="h",
+            title="Mean |SHAP| Importance",
+            color="importance",
+            color_continuous_scale="Viridis"
+        )
+        fig_imp.update_layout(yaxis={'categoryorder':'total ascending'})
+        st.plotly_chart(fig_imp, use_container_width=True)
+        st.write("### 🌈 SHAP Beeswarm (Plotly Version)")
+
+        # Flatten into long-format table
+        shap_long = pd.DataFrame(shap_vals, columns=X_sample.columns).melt(
+            var_name="feature", value_name="shap_value"
+        )
+        shap_long["abs"] = shap_long["shap_value"].abs()
+
+        fig_bee = px.strip(
+            shap_long,
+            x="shap_value",
+            y="feature",
+            color="abs",
+            # color_continuous_scale="RdBu_r",
+            title="Beeswarm-like SHAP Plot (Plotly)"
+        )
+        st.plotly_chart(fig_bee, use_container_width=True)
+        st.write("### 🎯 Local Explanation – Select a Sample")
+        idx = st.number_input("Sample index", min_value=0, max_value=len(X_sample)-1, value=0)
+        sample_features = X_sample.iloc[idx]
+        sample_shap = shap_vals[idx]
+        st.write("### 💧 Local Waterfall Plot (Plotly)")
+
+        base_value = explainer.expected_value[1] if shap_values.values.ndim == 3 else explainer.expected_value
+
+        df_local = pd.DataFrame({
+            "feature": X_sample.columns,
+            "shap": sample_shap,
+            "direction": ["positive" if v > 0 else "negative" for v in sample_shap]
+        }).sort_values("shap")
+
+        fig_local = go.Figure()
+
+        fig_local.add_trace(go.Bar(
+            x=df_local["shap"],
+            y=df_local["feature"],
+            orientation="h",
+            marker_color=df_local["shap"],
+            marker_colorscale="RdBu",
+        ))
+
+        fig_local.update_layout(
+            title=f"Local SHAP Values (Sample {idx})",
+            xaxis_title="SHAP Contribution",
+            yaxis_title="Feature",
+            height=600
+        )
+
+        st.plotly_chart(fig_local, use_container_width=True)
+
     else:
-        shap_vals = shap_values.values
-    st.write("### 📊 Global Feature Importance (Plotly)")
-
-    mean_abs = np.abs(shap_vals).mean(axis=0)
-    importance = pd.DataFrame({
-        "feature": X_sample.columns,
-        "importance": mean_abs
-    }).sort_values("importance", ascending=False)
-
-    fig_imp = px.bar(
-        importance.head(20),
-        x="importance",
-        y="feature",
-        orientation="h",
-        title="Mean |SHAP| Importance",
-        color="importance",
-        color_continuous_scale="Viridis"
-    )
-    fig_imp.update_layout(yaxis={'categoryorder':'total ascending'})
-    st.plotly_chart(fig_imp, use_container_width=True)
-    st.write("### 🌈 SHAP Beeswarm (Plotly Version)")
-
-    # Flatten into long-format table
-    shap_long = pd.DataFrame(shap_vals, columns=X_sample.columns).melt(
-        var_name="feature", value_name="shap_value"
-    )
-    shap_long["abs"] = shap_long["shap_value"].abs()
-
-    fig_bee = px.strip(
-        shap_long,
-        x="shap_value",
-        y="feature",
-        color="abs",
-        # color_continuous_scale="RdBu_r",
-        title="Beeswarm-like SHAP Plot (Plotly)"
-    )
-    st.plotly_chart(fig_bee, use_container_width=True)
-    st.write("### 🎯 Local Explanation – Select a Sample")
-    idx = st.number_input("Sample index", min_value=0, max_value=len(X_sample)-1, value=0)
-    sample_features = X_sample.iloc[idx]
-    sample_shap = shap_vals[idx]
-    st.write("### 💧 Local Waterfall Plot (Plotly)")
-
-    base_value = explainer.expected_value[1] if shap_values.values.ndim == 3 else explainer.expected_value
-
-    df_local = pd.DataFrame({
-        "feature": X_sample.columns,
-        "shap": sample_shap,
-        "direction": ["positive" if v > 0 else "negative" for v in sample_shap]
-    }).sort_values("shap")
-
-    fig_local = go.Figure()
-
-    fig_local.add_trace(go.Bar(
-        x=df_local["shap"],
-        y=df_local["feature"],
-        orientation="h",
-        marker_color=df_local["shap"],
-        marker_colorscale="RdBu",
-    ))
-
-    fig_local.update_layout(
-        title=f"Local SHAP Values (Sample {idx})",
-        xaxis_title="SHAP Contribution",
-        yaxis_title="Feature",
-        height=600
-    )
-
-    st.plotly_chart(fig_local, use_container_width=True)
-
-
-# else:
-#     st.info("Install SHAP for explainability: `pip install shap`")
+        st.info("Install SHAP for explainability: `pip install shap`")
