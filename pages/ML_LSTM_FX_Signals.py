@@ -525,10 +525,22 @@ y_test  = y_seq[seq_train_size:]
 
 # ---- Train RF model ----
 model = Sequential([
-    LSTM(32, input_shape=(X_train.shape[1], X_train.shape[2])),
-    Dropout(0.3),
+    LSTM(
+        48,
+        return_sequences=True,
+        input_shape=(X_train.shape[1], X_train.shape[2])
+    ),
+    Dropout(0.35),
+
+    LSTM(24, return_sequences=True),
+    Dropout(0.35),
+
+    LSTM(12),
+    Dropout(0.35),
+
     Dense(1, activation="sigmoid")
 ])
+
 
 model.compile(
     optimizer=Adam(learning_rate=0.001),
