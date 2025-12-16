@@ -113,7 +113,7 @@ def load_fx(symbol, timeframe, start_date, end_date):
 # ========================================================
 @st.cache_data
 def load_macro_fred(start_date, end_date):
-    fred = Fred(api_key=st.secrets["FRED_API_KEY"])
+    fred = Fred(api_key="bbe32ce50b3dd85ebfd546a30454b4c9")
 
     series_map = {
         "ecb_rate": "ECBDFR",
