@@ -2,6 +2,14 @@
 
 Streamlit workspace for researching and stress-testing a dual-exponential-smoothing FX trading strategy. The app ingests Yahoo Finance prices, applies configurable α/β smoothing, produces trade signals, backtests with transaction costs, and offers parameter optimization plus ML-based signal experiments.
 
+## Collaborators
+
+- Tanish Patel <tp2899@columbia.edu>
+- Aditya Pendyala <ap4839@columbia.edu>
+- Rishit Belani <rb3881@columbia.edu>
+- Arnav Ahuja <aa5790@columbia.edu>
+- Aryamaan Srivastava <as7845@columbia.edu>
+
 ---
 
 ## Table of Contents
